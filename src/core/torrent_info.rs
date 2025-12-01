@@ -14,7 +14,7 @@ pub struct Torrent {
 pub struct Info {
     pub name: String,
 
-    // FIX IS HERE: Map "piece length" from file to "piece_length" in Rust
+
     #[serde(rename = "piece length")] 
     pub piece_length: usize,
 
@@ -30,7 +30,7 @@ impl Torrent {
         let torrent: Torrent =
             serde_bencode::from_bytes(&file_content).context("Failed to decode bencode data")?;
 
-        Ok(torrent) // Use standard Ok
+        Ok(torrent) 
     }
 
     pub fn calculate_info_hash(&self) -> anyhow::Result<[u8; 20]> {
