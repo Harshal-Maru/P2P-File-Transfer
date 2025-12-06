@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     println!("File:       {}", torrent.info.name);
     println!("Info Hash:  {}", hex::encode(&info_hash));
     println!("Peer ID:    {}", String::from_utf8_lossy(&peer_id));
+    println!("Piece Length: {} bytes", torrent.info.piece_length);
     println!("---------------------------------");
     
     // 3. Discovery (Get Peers from Tracker)
@@ -32,18 +33,24 @@ async fn main() -> anyhow::Result<()> {
     println!("Found {} peers.", peers.len());
 
     // 4. Connection Loop
-    // We attempt to connect to the first 10 peers.
-    // If run_peer_session returns Ok(()), it means we successfully downloaded a block!
     for (i, peer) in peers.iter().enumerate().take(10) {
         println!("\n--- Attempt {}/10: Connecting to {} ---", i + 1, peer);
         
-        match network::run_peer_session(peer, info_hash, peer_id).await {
-            Ok(_) => {
-                println!("✨ Success! Download test completed.");
-                break; // Exit after successful download of one block
+        // 👇 UPDATED CALL: We pass '&torrent' and '0' (Piece Index)
+        match network::run_peer_session(peer, info_hash, peer_id, &torrent, 0).await {
+            Ok(piece_data) => {
+                println!("Success! Piece 0 downloaded and verified.");
+                println!("Size: {} bytes", piece_data.len());
+                
+                // Optional: Save it to disk to prove it works
+                let filename = format!("piece_0_{}.bin", torrent.info.name);
+                std::fs::write(&filename, piece_data).unwrap();
+                println!("   Saved to file: {}", filename);
+                
+                break; // Exit after success
             }
             Err(e) => {
-                eprintln!("❌ Connection failed: {}", e);
+                eprintln!("Connection failed: {}", e);
             }
         }
     }
