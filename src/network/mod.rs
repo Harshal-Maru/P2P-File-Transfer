@@ -7,7 +7,7 @@ use handshake::Handshake;
 use message::Message;
 use sha1::{Digest, Sha1};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -122,22 +122,50 @@ pub async fn run_peer_session(
 
                                 if actual_hash == expected_hash {
                                     println!(
-                                        "✅ {}: Piece {} Verified!",
+                                        "{}: Piece {} Verified!",
                                         peer_addr, state.piece_index
                                     );
                                     m.mark_piece_complete(state.piece_index);
 
-                                    // Save to disk (Naive approach: One file per piece)
-                                    // In a real app, you'd seek/write to a large file.
-                                    let filename = format!("downloads/piece_{}", state.piece_index);
-                                    tokio::fs::create_dir_all("downloads").await.ok();
-                                    tokio::fs::write(&filename, &state.piece_buffer).await?;
+                                    // 1. Prepare the Downloads folder
+                                    let output_dir = "downloads";
+                                    tokio::fs::create_dir_all(output_dir).await.ok();
 
-                                    // Reset work so we pick a new piece next loop
+                                    // 2. Construct the full path (downloads/ubuntu.iso)
+                                    let filename = &m.torrent.info.name;
+                                    let filepath = format!("{}/{}", output_dir, filename);
+
+                                    // 3. Open the file in Read/Write mode
+                                    // 'create(true)' makes it if missing.
+                                    // 'write(true)' allows us to modify it.
+                                    // We open a fresh handle per piece. This relies on the OS's file locking
+                                    // to handle concurrency, which is safe for simple writes.
+                                    let mut file = tokio::fs::OpenOptions::new()
+                                        .write(true)
+                                        .create(true)
+                                        .open(&filepath)
+                                        .await?;
+
+                                    // 4. Calculate the Byte Offset
+                                    // Example: Piece 0 starts at 0. Piece 1 starts at 262144.
+                                    let offset =
+                                        (state.piece_index as u64) * (state.piece_length as u64);
+
+                                    // 5. Seek to the correct position
+                                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+
+                                    // 6. Write the data
+                                    file.write_all(&state.piece_buffer).await?;
+                                    println!(
+                                        "Wrote Piece {} to {}",
+                                        state.piece_index, filepath
+                                    );
+
+                                    // Reset work
                                     current_work = None;
                                 } else {
                                     println!(
-                                        "❌ {}: Piece {} Hash Mismatch",
+                                        "{}: Piece {} Hash Mismatch",
                                         peer_addr, state.piece_index
                                     );
                                     m.reset_piece(state.piece_index);
