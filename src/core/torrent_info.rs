@@ -4,7 +4,7 @@ use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use std::fs;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Torrent {
     // The URL of the tracker that coordinates the swarm
     pub announce: String,
@@ -12,7 +12,7 @@ pub struct Torrent {
     pub info: Info,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Info {
     pub name: String,
 

@@ -4,55 +4,53 @@ mod utils;
 
 use std::env;
 use std::process;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::core::manager::TorrentManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Parse Arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: cargo run <torrent_file>");
         process::exit(1);
     }
 
-    // 2. Load Torrent & Meta Info
     println!("Loading torrent file: {}", args[1]);
     let torrent = core::torrent_info::Torrent::read(&args[1])?;
     let info_hash = torrent.calculate_info_hash()?;
     let peer_id = utils::generate_peer_id();
 
-    println!("---------------------------------");
-    println!("File:       {}", torrent.info.name);
-    println!("Info Hash:  {}", hex::encode(&info_hash));
-    println!("Peer ID:    {}", String::from_utf8_lossy(&peer_id));
-    println!("Piece Length: {} bytes", torrent.info.piece_length);
-    println!("---------------------------------");
-    
-    // 3. Discovery (Get Peers from Tracker)
-    println!("Contacting Tracker to find peers...");
+    println!("File: {}", torrent.info.name);
+
+    // 1. Init Manager
+    let manager = Arc::new(Mutex::new(TorrentManager::new(torrent.clone())));
+
+    // 2. Get Peers
+    println!("Contacting Tracker...");
     let peers = core::tracker::Response::request_peers(&torrent, &peer_id).await?;
     println!("Found {} peers.", peers.len());
 
-    // 4. Connection Loop
-    for (i, peer) in peers.iter().enumerate().take(10) {
-        println!("\n--- Attempt {}/10: Connecting to {} ---", i + 1, peer);
-        
-        // 👇 UPDATED CALL: We pass '&torrent' and '0' (Piece Index)
-        match network::run_peer_session(peer, info_hash, peer_id, &torrent, 0).await {
-            Ok(piece_data) => {
-                println!("Success! Piece 0 downloaded and verified.");
-                println!("Size: {} bytes", piece_data.len());
-                
-                // Optional: Save it to disk to prove it works
-                let filename = format!("piece_0_{}.bin", torrent.info.name);
-                std::fs::write(&filename, piece_data).unwrap();
-                println!("   Saved to file: {}", filename);
-                
-                break; // Exit after success
-            }
-            Err(e) => {
-                eprintln!("Connection failed: {}", e);
-            }
-        }
+    // 3. Spawn Tasks
+    let mut handles = vec![];
+    
+    // Connect to first 20 peers in parallel
+    for peer in peers.into_iter().take(20) {
+        let manager_clone = manager.clone();
+        let peer_id_clone = peer_id;
+        let info_hash_clone = info_hash;
+
+        let handle = tokio::spawn(async move {
+            // We ignore errors from individual peers; other peers will pick up the slack
+            let _ = network::run_peer_session(peer, info_hash_clone, peer_id_clone, manager_clone).await;
+        });
+        handles.push(handle);
+    }
+
+    // 4. Wait for completion
+    // In a real app, we'd wait for a signal. Here we just wait for all tasks (or Ctrl+C)
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())

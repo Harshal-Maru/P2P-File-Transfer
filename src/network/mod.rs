@@ -1,28 +1,37 @@
 pub mod handshake;
 pub mod message;
 
-use crate::core::torrent_info::Torrent;
+use crate::core::manager::TorrentManager;
 use anyhow::{Context, Result};
 use handshake::Handshake;
 use message::Message;
-use sha1::{Digest, Sha1}; // <--- Needed for verification!
+use sha1::{Digest, Sha1};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout}; // <--- Needed for metadata
+use tokio::sync::Mutex;
+use tokio::time::{Duration, timeout};
 
 const BLOCK_MAX: u32 = 16384;
 
+// State to track what this specific peer is currently working on
+struct PeerSessionState {
+    piece_index: usize,
+    piece_buffer: Vec<u8>,
+    downloaded: u32,
+    requested: u32,
+    piece_length: u32,
+}
+
 pub async fn run_peer_session(
-    peer_addr: &str,
+    peer_addr: String,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
-    torrent: &Torrent, // <--- NEW ARGUMENT
-    piece_index: u32,  // <--- NEW ARGUMENT (Which piece to download)
-) -> Result<Vec<u8>> {
-    // <--- Returns the full piece data on success
+    manager: Arc<Mutex<TorrentManager>>, // Shared Manager
+) -> Result<()> {
     println!("Connecting to {}...", peer_addr);
 
-    let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer_addr))
+    let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(&peer_addr))
         .await
         .context("Connection timed out")?
         .context(format!("Failed to connect to peer: {}", peer_addr))?;
@@ -35,24 +44,20 @@ pub async fn run_peer_session(
     stream.read_exact(&mut response_buf).await?;
 
     if &response_buf[28..48] != info_hash {
-        anyhow::bail!("Invalid Info Hash from peer");
+        anyhow::bail!("Invalid Info Hash");
     }
-    println!("Handshake Successful.");
+    println!("{}: Handshake Successful", peer_addr);
 
     // --- 2. Interested ---
     let msg = Message::Interested;
     stream.write_all(&msg.serialize()).await?;
-    println!("Sent: Interested");
 
     // --- STATE TRACKING ---
     let mut am_unchoked = false;
-    let mut peer_has_piece = false;
+    let mut peer_has_pieces = vec![false; manager.lock().await.piece_status.len()];
 
-    // DOWNLOAD STATE
-    let piece_length = torrent.info.piece_length as u32;
-    let mut piece_buffer = vec![0u8; piece_length as usize]; // The Assembly Buffer
-    let mut downloaded = 0u32; // How many bytes we have received
-    let mut requested = 0u32; // How many bytes we have asked for
+    // The current piece this peer is working on (if any)
+    let mut current_work: Option<PeerSessionState> = None;
 
     // --- 3. Message Loop ---
     loop {
@@ -60,121 +65,144 @@ pub async fn run_peer_session(
 
         match frame {
             Message::Choke => {
-                println!("Peer Choked us");
+                println!("{}: Choked", peer_addr);
                 am_unchoked = false;
+                // Ideally we would release the piece back to the manager here,
+                // but for simplicity we hold onto it hoping they unchoke us.
             }
             Message::Unchoke => {
-                println!("Peer Unchoked us!");
+                println!("{}: Unchoked", peer_addr);
                 am_unchoked = true;
-
-                // If we haven't started requesting yet, start now!
-                if peer_has_piece && requested < piece_length {
-                    println!("Requesting Piece {}, Block 0...", piece_index);
-                    let request = Message::Request {
-                        index: piece_index,
-                        begin: 0,
-                        length: BLOCK_MAX,
-                    };
-                    stream.write_all(&request.serialize()).await?;
-                    requested += BLOCK_MAX;
-                }
             }
             Message::Interested => {}
             Message::NotInterested => {}
 
             Message::Have { index } => {
-                if index == piece_index {
-                    peer_has_piece = true;
-                    // Trigger download if unchoked and waiting
-                    if am_unchoked && requested == 0 {
-                        let request = Message::Request {
-                            index: piece_index,
-                            begin: 0,
-                            length: BLOCK_MAX,
-                        };
-                        stream.write_all(&request.serialize()).await?;
-                        requested += BLOCK_MAX;
+                if (index as usize) < peer_has_pieces.len() {
+                    peer_has_pieces[index as usize] = true;
+                }
+            }
+            Message::Bitfield(bitfield) => {
+                // Populate peer_has_pieces from the bitfield bytes
+                // (Simplification: assuming dense bitfield for this step)
+                for (i, byte) in bitfield.iter().enumerate() {
+                    for bit in 0..8 {
+                        let piece_idx = i * 8 + bit;
+                        if piece_idx < peer_has_pieces.len() && (byte & (1 << (7 - bit))) != 0 {
+                            peer_has_pieces[piece_idx] = true;
+                        }
                     }
                 }
             }
-
-            Message::Bitfield(_) => {
-                // In a real client, we check the bitfield for piece_index.
-                // For now, assume they have it.
-                peer_has_piece = true;
-                if am_unchoked && requested == 0 {
-                    let request = Message::Request {
-                        index: piece_index,
-                        begin: 0,
-                        length: BLOCK_MAX,
-                    };
-                    stream.write_all(&request.serialize()).await?;
-                    requested += BLOCK_MAX;
-                }
-            }
-
-            Message::Request { .. } => {}
 
             Message::Piece {
                 index,
                 begin,
                 block,
             } => {
-                // Ignore pieces we didn't ask for
-                if index != piece_index {
-                    continue;
-                }
+                // Handle incoming data
+                if let Some(state) = &mut current_work {
+                    if state.piece_index == index as usize {
+                        let begin_usize = begin as usize;
+                        if begin_usize + block.len() <= state.piece_buffer.len() {
+                            state.piece_buffer[begin_usize..begin_usize + block.len()]
+                                .copy_from_slice(&block);
+                            state.downloaded += block.len() as u32;
 
-                let begin_usize = begin as usize;
+                            // Check Completion
+                            if state.downloaded == state.piece_length {
+                                // Verify Hash
+                                let mut hasher = Sha1::new();
+                                hasher.update(&state.piece_buffer);
+                                let actual_hash: [u8; 20] = hasher.finalize().into();
 
-                // Safety check to prevent buffer overflow
-                if begin_usize + block.len() > piece_buffer.len() {
-                    anyhow::bail!("Received block goes out of bounds!");
-                }
+                                // Lock manager to get expected hash & update status
+                                let mut m = manager.lock().await;
+                                let expected_hash = m.torrent.get_piece_hash(state.piece_index)?;
 
-                // COPY DATA TO BUFFER
-                piece_buffer[begin_usize..begin_usize + block.len()].copy_from_slice(&block);
-                downloaded += block.len() as u32;
-                println!("Downloaded {}/{} bytes", downloaded, piece_length);
+                                if actual_hash == expected_hash {
+                                    println!(
+                                        "✅ {}: Piece {} Verified!",
+                                        peer_addr, state.piece_index
+                                    );
+                                    m.mark_piece_complete(state.piece_index);
 
-                // CHECK IF COMPLETE
-                if downloaded == piece_length {
-                    println!("Piece {} download complete. Verifying Hash...", piece_index);
+                                    // Save to disk (Naive approach: One file per piece)
+                                    // In a real app, you'd seek/write to a large file.
+                                    let filename = format!("downloads/piece_{}", state.piece_index);
+                                    tokio::fs::create_dir_all("downloads").await.ok();
+                                    tokio::fs::write(&filename, &state.piece_buffer).await?;
 
-                    // SHA-1 VERIFICATION
-                    let mut hasher = Sha1::new();
-                    hasher.update(&piece_buffer);
-                    let actual_hash: [u8; 20] = hasher.finalize().into();
-
-                    // You need to implement get_piece_hash in torrent_info.rs!
-                    let expected_hash = torrent.get_piece_hash(piece_index as usize)?;
-
-                    if actual_hash == expected_hash {
-                        println!(" Hash Matched! Piece is valid.");
-                        return Ok(piece_buffer);
-                    } else {
-                        println!("Hash Mismatch! Data corrupted.");
-                        anyhow::bail!("Piece verification failed");
+                                    // Reset work so we pick a new piece next loop
+                                    current_work = None;
+                                } else {
+                                    println!(
+                                        "❌ {}: Piece {} Hash Mismatch",
+                                        peer_addr, state.piece_index
+                                    );
+                                    m.reset_piece(state.piece_index);
+                                    current_work = None;
+                                }
+                            }
+                        }
                     }
-                }
-
-                // PIPELINE: If not complete, Request the NEXT block immediately
-                if am_unchoked && requested < piece_length {
-                    // Calculate remaining size (handle last block being smaller than 16KB)
-                    let remaining = piece_length - requested;
-                    let block_size = std::cmp::min(BLOCK_MAX, remaining);
-
-                    let request = Message::Request {
-                        index: piece_index,
-                        begin: requested,
-                        length: block_size,
-                    };
-                    stream.write_all(&request.serialize()).await?;
-                    requested += block_size;
                 }
             }
 
-            Message::KeepAlive => println!("Peer sent KeepAlive"),
+            Message::Request { .. } => {}
+            Message::KeepAlive => {}
+        }
+
+        // --- WORK ASSIGNMENT LOGIC ---
+        // If we are unchoked and don't have work, ask the manager for a piece!
+        if am_unchoked && current_work.is_none() {
+            let mut m = manager.lock().await;
+
+            // 👇 CHANGE: Pass the bitfield to the manager
+            if let Some(index) = m.pick_next_piece(&peer_has_pieces) {
+                // We are guaranteed that this peer has the piece now.
+                let piece_len = m.torrent.info.piece_length as u32;
+                drop(m); // Unlock manager immediately
+
+                println!("{}: Starting Piece {}", peer_addr, index);
+                current_work = Some(PeerSessionState {
+                    piece_index: index,
+                    piece_buffer: vec![0u8; piece_len as usize],
+                    downloaded: 0,
+                    requested: 0,
+                    piece_length: piece_len,
+                });
+            } else {
+                // No pieces left that this peer has.
+                drop(m); // Release lock
+                // We wait loop to continue, maybe they announce more pieces later.
+            }
+        }
+        // --- PIPELINE LOGIC ---
+        // If we have work, keep pipelines full (Queue 5 blocks / 80KB at a time)
+        if let Some(state) = &mut current_work {
+            // PIPELINE SIZE: 5 blocks (Adjustable)
+            // While we are unchoked AND we haven't asked for the whole file
+            // AND the amount of "In Flight" data is less than 5 blocks...
+            while am_unchoked
+                && state.requested < state.piece_length
+                && (state.requested - state.downloaded) < (BLOCK_MAX * 5)
+            {
+                // Request the next block
+                let remaining = state.piece_length - state.requested;
+                let block_size = std::cmp::min(BLOCK_MAX, remaining);
+
+                let request = Message::Request {
+                    index: state.piece_index as u32,
+                    begin: state.requested,
+                    length: block_size,
+                };
+                stream.write_all(&request.serialize()).await?;
+
+                // Advance the "Requested" cursor, but "Downloaded" stays the same
+                // untill data arrives.
+                state.requested += block_size;
+            }
         }
     }
 }
