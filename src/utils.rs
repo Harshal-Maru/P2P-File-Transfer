@@ -22,3 +22,5 @@ pub fn generate_peer_id() -> [u8; 20] {
 pub fn url_encode (data: &[u8]) -> String {
     form_urlencoded::byte_serialize(data).collect()
 }
+
+
