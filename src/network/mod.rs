@@ -217,6 +217,7 @@ pub async fn run_peer_session(
                                                     [write_start_in_piece as usize
                                                         ..write_end_in_piece as usize];
                                                 file.write_all(buffer_slice).await?;
+                                                file.sync_all().await?;
 
                                                 let slice_len =
                                                     write_end_in_piece - write_start_in_piece;
@@ -225,7 +226,7 @@ pub async fn run_peer_session(
                                                     slice_len, path
                                                 );
                                             }
-                                            file_global_start += (file_len as u64);
+                                            file_global_start += file_len as u64;
                                         }
 
                                         // Done with this piece

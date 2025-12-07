@@ -31,8 +31,6 @@ async fn main() -> anyhow::Result<()> {
     println!("---------------------------------");
 
     // 3. Init Manager
-
-    // 3. Init Manager
     // Note: We need a temporary mutable manager to run verification BEFORE wrapping in Arc<Mutex>
     let mut temp_manager = TorrentManager::new(torrent.clone());
 
@@ -42,13 +40,18 @@ async fn main() -> anyhow::Result<()> {
     // Now wrap it
     let manager = Arc::new(Mutex::new(temp_manager));
 
-    // 4. SUPERVISION LOOP (The Fix)
+    // 4. SUPERVISION LOOP
     loop {
         // A. Check if done
         {
             let m = manager.lock().await;
             if m.is_complete() {
-                println!("DOWNLOAD COMPLETE! Exiting.");
+                println!("DOWNLOAD COMPLETE!");
+
+                drop(m);
+                sleep(Duration::from_secs(2)).await;
+
+                println!("Exiting.");
                 break;
             }
             println!(
@@ -91,8 +94,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // D. Wait before asking again (End Game Strategy)
-        // We wait 10 seconds. In the meantime, the background tasks we just spawned
-        // are running and downloading pieces.
         sleep(Duration::from_secs(10)).await;
     }
 

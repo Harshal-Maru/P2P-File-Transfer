@@ -66,12 +66,53 @@ impl TorrentManager {
         self.downloaded_pieces == self.piece_status.len()
     }
 
+// ... inside impl TorrentManager ...
 
     pub fn verify_existing_data(&mut self) {
         println!("Checking existing files for resume...");
         let output_dir = "downloads";
+        
+        // --- PHASE 0: PRE-ALLOCATE FILES ---
+        // This ensures files exist and are the correct size, preventing "Read Errors" on the last piece
+        // and fixing sparse file issues.
+        let files_list = if let Some(files) = &self.torrent.info.files {
+            files.iter().map(|f| {
+                let mut path = std::path::PathBuf::from(output_dir);
+                path.push(&self.torrent.info.name);
+                for part in &f.path { path.push(part); }
+                (path, f.length)
+            }).collect::<Vec<_>>()
+        } else {
+            let mut path = std::path::PathBuf::from(output_dir);
+            path.push(&self.torrent.info.name);
+            vec![(path, self.torrent.total_length())]
+        };
 
-        // We need to verify piece by piece
+        for (path, length) in &files_list {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            
+            // Open for Read/Write/Create
+            match std::fs::OpenOptions::new().write(true).create(true).read(true).open(path) {
+                Ok(file) => {
+                    // Get current size
+                    let current_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                    
+                    // If file is too small, extend it to the correct size
+                    if current_len < *length as u64 {
+                        println!("Pre-allocating file: {:?} ({} bytes)", path, length);
+                        if let Err(e) = file.set_len(*length as u64) {
+                            println!("Failed to pre-allocate file: {}", e);
+                        }
+                    }
+                },
+                Err(e) => println!("Failed to open file for pre-allocation: {}", e),
+            }
+        }
+
+        // --- PHASE 1: VERIFY PIECES ---
+        println!("Verifying piece hashes...");
         for index in 0..self.piece_status.len() {
             let piece_index = index;
             let expected_hash = match self.torrent.get_piece_hash(piece_index) {
@@ -81,17 +122,20 @@ impl TorrentManager {
 
             let expected_size = self.torrent.calculate_piece_size(piece_index) as u64;
 
-            // 1. Read the piece data from disk using the EXACT size
-            if let Ok(buffer) = self.read_piece_from_disk(piece_index, expected_size, output_dir) {
-                // 2. Hash it
-                let mut hasher = Sha1::new();
-                hasher.update(&buffer);
-                let actual_hash: [u8; 20] = hasher.finalize().into();
+            match self.read_piece_from_disk(piece_index, expected_size, output_dir) {
+                Ok(buffer) => {
+                    let mut hasher = Sha1::new();
+                    hasher.update(&buffer);
+                    let actual_hash: [u8; 20] = hasher.finalize().into();
 
-                // 3. If match, mark complete
-                if actual_hash == expected_hash {
-                    self.piece_status[piece_index] = PieceStatus::Complete;
-                    self.downloaded_pieces += 1;
+                    if actual_hash == expected_hash {
+                        self.piece_status[piece_index] = PieceStatus::Complete;
+                        self.downloaded_pieces += 1;
+                    } 
+                    // No need to print mismatch errors, we assume Pending if mismatch
+                },
+                Err(_) => {
+                    // Ignore read errors (just means piece is missing)
                 }
             }
         }
@@ -102,7 +146,6 @@ impl TorrentManager {
             self.piece_status.len()
         );
     }
-
     // Helper to read a full piece from the multi-file structure
     fn read_piece_from_disk(
         &self,
