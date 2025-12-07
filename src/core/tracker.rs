@@ -39,7 +39,7 @@ impl Response {
             torrent.announce,
             encoded_info_hash,
             encoded_peer_id,
-            torrent.info.length.unwrap_or(0)
+            torrent.total_length()
         );
 
         let response = reqwest::get(&url)

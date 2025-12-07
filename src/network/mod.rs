@@ -122,48 +122,109 @@ pub async fn run_peer_session(
 
                                 if actual_hash == expected_hash {
                                     println!(
-                                        "{}: Piece {} Verified!",
+                                        " {}: Piece {} Verified!",
                                         peer_addr, state.piece_index
                                     );
                                     m.mark_piece_complete(state.piece_index);
 
-                                    // 1. Prepare the Downloads folder
                                     let output_dir = "downloads";
-                                    tokio::fs::create_dir_all(output_dir).await.ok();
+                                    let piece_len = state.piece_length as u64;
+                                    let piece_global_start = (state.piece_index as u64) * piece_len;
+                                    let piece_global_end = piece_global_start + piece_len;
 
-                                    // 2. Construct the full path (downloads/ubuntu.iso)
-                                    let filename = &m.torrent.info.name;
-                                    let filepath = format!("{}/{}", output_dir, filename);
+                                    // 1. Get the list of files.
+                                    // If single-file, we fake a list containing just one file.
+                                    let files_list = if let Some(files) = &m.torrent.info.files {
+                                        // MULTI-FILE MODE
+                                        // In multi-file, info.name is the FOLDER name.
+                                        files
+                                            .iter()
+                                            .map(|f| {
+                                                let mut path = std::path::PathBuf::from(output_dir);
+                                                path.push(&m.torrent.info.name); // Add folder
+                                                for part in &f.path {
+                                                    path.push(part);
+                                                }
+                                                (path, f.length)
+                                            })
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        // SINGLE-FILE MODE
+                                        let mut path = std::path::PathBuf::from(output_dir);
+                                        path.push(&m.torrent.info.name);
+                                        // Use total_length because info.length is Option
+                                        vec![(path, m.torrent.total_length())]
+                                    };
 
-                                    // 3. Open the file in Read/Write mode
-                                    // 'create(true)' makes it if missing.
-                                    // 'write(true)' allows us to modify it.
-                                    // We open a fresh handle per piece. This relies on the OS's file locking
-                                    // to handle concurrency, which is safe for simple writes.
-                                    let mut file = tokio::fs::OpenOptions::new()
-                                        .write(true)
-                                        .create(true)
-                                        .open(&filepath)
-                                        .await?;
+                                    // 2. Iterate through files and write relevant chunks
+                                    let mut file_global_start = 0u64;
 
-                                    // 4. Calculate the Byte Offset
-                                    // Example: Piece 0 starts at 0. Piece 1 starts at 262144.
-                                    let offset =
-                                        (state.piece_index as u64) * (state.piece_length as u64);
+                                    for (path, file_len) in files_list {
+                                        let file_global_end = file_global_start + (file_len as u64);
 
-                                    // 5. Seek to the correct position
-                                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+                                        // Check for Overlap: Does this file contain any part of our piece?
+                                        // Overlap logic: File starts before piece ends AND File ends after piece starts
+                                        if file_global_end > piece_global_start
+                                            && file_global_start < piece_global_end
+                                        {
+                                            // 3. Calculate the slice of the piece to write
+                                            let write_start_in_piece =
+                                                if file_global_start > piece_global_start {
+                                                    file_global_start - piece_global_start
+                                                } else {
+                                                    0
+                                                };
 
-                                    // 6. Write the data
-                                    file.write_all(&state.piece_buffer).await?;
-                                    println!(
-                                        "Wrote Piece {} to {}",
-                                        state.piece_index, filepath
-                                    );
+                                            let write_end_in_piece =
+                                                if file_global_end < piece_global_end {
+                                                    file_global_end - piece_global_start
+                                                } else {
+                                                    piece_len
+                                                };
+
+                                            let slice_len =
+                                                write_end_in_piece - write_start_in_piece;
+
+                                            // 4. Calculate offset in the file
+                                            let seek_pos_in_file =
+                                                if piece_global_start > file_global_start {
+                                                    piece_global_start - file_global_start
+                                                } else {
+                                                    0
+                                                };
+
+                                            // 5. Ensure parent directories exist
+                                            if let Some(parent) = path.parent() {
+                                                tokio::fs::create_dir_all(parent).await.ok();
+                                            }
+
+                                            // 6. Write the data
+                                            let mut file = tokio::fs::OpenOptions::new()
+                                                .write(true)
+                                                .create(true)
+                                                .open(&path)
+                                                .await?;
+
+                                            file.seek(std::io::SeekFrom::Start(seek_pos_in_file))
+                                                .await?;
+
+                                            // Extract buffer slice
+                                            let buffer_slice = &state.piece_buffer
+                                                [write_start_in_piece as usize
+                                                    ..write_end_in_piece as usize];
+
+                                            file.write_all(buffer_slice).await?;
+                                            println!("Wrote {} bytes to {:?}", slice_len, path);
+                                        }
+
+                                        // Move cursor for next file
+                                        file_global_start += (file_len as u64);
+                                    }
 
                                     // Reset work
                                     current_work = None;
                                 } else {
+                                    // ... error handling
                                     println!(
                                         "{}: Piece {} Hash Mismatch",
                                         peer_addr, state.piece_index

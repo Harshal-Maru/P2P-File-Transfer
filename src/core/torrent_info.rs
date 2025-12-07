@@ -27,6 +27,14 @@ pub struct Info {
 
     // File size (Optional to support multi-file torrents structure in future)
     pub length: Option<i64>,
+
+    pub files: Option<Vec<FileNode>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FileNode {
+    pub length: i64,
+    pub path: Vec<String>, // e.g., ["bin", "data.pak"]
 }
 
 impl Torrent {
@@ -65,5 +73,15 @@ impl Torrent {
         let mut hash = [0u8; 20];
         hash.copy_from_slice(&self.info.pieces[start..end]);
         Ok(hash)
+    }
+
+    pub fn total_length(&self) -> i64 {
+        if let Some(len) = self.info.length {
+            return len;
+        }
+        if let Some(files) = &self.info.files {
+            return files.iter().map(|f| f.length).sum();
+        }
+        0
     }
 }
