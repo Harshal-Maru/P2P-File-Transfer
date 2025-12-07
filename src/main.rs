@@ -2,55 +2,98 @@ mod core;
 mod network;
 mod utils;
 
+use crate::core::manager::TorrentManager;
 use std::env;
 use std::process;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::core::manager::TorrentManager;
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 1. Parse Arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: cargo run <torrent_file>");
         process::exit(1);
     }
 
+    // 2. Load Torrent & Meta Info
     println!("Loading torrent file: {}", args[1]);
     let torrent = core::torrent_info::Torrent::read(&args[1])?;
     let info_hash = torrent.calculate_info_hash()?;
     let peer_id = utils::generate_peer_id();
 
-    println!("File: {}", torrent.info.name);
+    println!("---------------------------------");
+    println!("File:       {}", torrent.info.name);
+    println!("Info Hash:  {}", hex::encode(&info_hash));
+    println!("Peer ID:    {}", String::from_utf8_lossy(&peer_id));
+    println!("---------------------------------");
 
-    // 1. Init Manager
-    let manager = Arc::new(Mutex::new(TorrentManager::new(torrent.clone())));
+    // 3. Init Manager
 
-    // 2. Get Peers
-    println!("Contacting Tracker...");
-    let peers = core::tracker::Response::request_peers(&torrent, &peer_id).await?;
-    println!("Found {} peers.", peers.len());
+    // 3. Init Manager
+    // Note: We need a temporary mutable manager to run verification BEFORE wrapping in Arc<Mutex>
+    let mut temp_manager = TorrentManager::new(torrent.clone());
 
-    // 3. Spawn Tasks
-    let mut handles = vec![];
-    
-    // Connect to first 20 peers in parallel
-    for peer in peers.into_iter().take(20) {
-        let manager_clone = manager.clone();
-        let peer_id_clone = peer_id;
-        let info_hash_clone = info_hash;
+    // CHECK EXISTING FILES
+    temp_manager.verify_existing_data();
 
-        let handle = tokio::spawn(async move {
-            // We ignore errors from individual peers; other peers will pick up the slack
-            let _ = network::run_peer_session(peer, info_hash_clone, peer_id_clone, manager_clone).await;
-        });
-        handles.push(handle);
-    }
+    // Now wrap it
+    let manager = Arc::new(Mutex::new(temp_manager));
 
-    // 4. Wait for completion
-    // In a real app, we'd wait for a signal. Here we just wait for all tasks (or Ctrl+C)
-    for handle in handles {
-        let _ = handle.await;
+    // 4. SUPERVISION LOOP (The Fix)
+    loop {
+        // A. Check if done
+        {
+            let m = manager.lock().await;
+            if m.is_complete() {
+                println!("DOWNLOAD COMPLETE! Exiting.");
+                break;
+            }
+            println!(
+                "Status: {}/{} pieces. Refreshing peers...",
+                m.downloaded_pieces,
+                m.piece_status.len()
+            );
+        }
+
+        // B. Contact Tracker
+        println!("Contacting Tracker...");
+        // We catch errors here so the loop doesn't crash if the tracker is temporarily down
+        match core::tracker::Response::request_peers(&torrent, &peer_id).await {
+            Ok(peers) => {
+                println!("Found {} peers. Spawning workers...", peers.len());
+
+                // C. Spawn Tasks
+                for peer in peers.into_iter().take(20) {
+                    // Limit to 20 concurrent connections
+                    let manager_clone = manager.clone();
+                    let peer_id_clone = peer_id;
+                    let info_hash_clone = info_hash;
+
+                    tokio::spawn(async move {
+                        // We run the session. If it fails or finishes, the task dies.
+                        // The main loop will respawn new ones later if needed.
+                        let _ = network::run_peer_session(
+                            peer,
+                            info_hash_clone,
+                            peer_id_clone,
+                            manager_clone,
+                        )
+                        .await;
+                    });
+                }
+            }
+            Err(e) => {
+                println!("Tracker failed: {}. Retrying in 5s...", e);
+            }
+        }
+
+        // D. Wait before asking again (End Game Strategy)
+        // We wait 10 seconds. In the meantime, the background tasks we just spawned
+        // are running and downloading pieces.
+        sleep(Duration::from_secs(10)).await;
     }
 
     Ok(())

@@ -1,5 +1,6 @@
-use std::sync::Mutex;
 use crate::core::torrent_info::Torrent;
+use sha1::{Digest, Sha1};
+use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PieceStatus {
@@ -23,6 +24,7 @@ impl TorrentManager {
             downloaded_pieces: 0,
         }
     }
+
     // We iterate through pieces. We pick one ONLY if:
     // 1. It is Pending
     // 2. The connected peer actually HAS it
@@ -44,9 +46,10 @@ impl TorrentManager {
         if self.piece_status[index] != PieceStatus::Complete {
             self.piece_status[index] = PieceStatus::Complete;
             self.downloaded_pieces += 1;
-            println!("Manager: Piece {} finished. Progress: {}/{}", 
-                index, 
-                self.downloaded_pieces, 
+            println!(
+                "Manager: Piece {} finished. Progress: {}/{}",
+                index,
+                self.downloaded_pieces,
                 self.piece_status.len()
             );
         }
@@ -61,5 +64,130 @@ impl TorrentManager {
 
     pub fn is_complete(&self) -> bool {
         self.downloaded_pieces == self.piece_status.len()
+    }
+
+
+    pub fn verify_existing_data(&mut self) {
+        println!("Checking existing files for resume...");
+        let output_dir = "downloads";
+
+        // We need to verify piece by piece
+        for index in 0..self.piece_status.len() {
+            let piece_index = index;
+            let expected_hash = match self.torrent.get_piece_hash(piece_index) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            let expected_size = self.torrent.calculate_piece_size(piece_index) as u64;
+
+            // 1. Read the piece data from disk using the EXACT size
+            if let Ok(buffer) = self.read_piece_from_disk(piece_index, expected_size, output_dir) {
+                // 2. Hash it
+                let mut hasher = Sha1::new();
+                hasher.update(&buffer);
+                let actual_hash: [u8; 20] = hasher.finalize().into();
+
+                // 3. If match, mark complete
+                if actual_hash == expected_hash {
+                    self.piece_status[piece_index] = PieceStatus::Complete;
+                    self.downloaded_pieces += 1;
+                }
+            }
+        }
+
+        println!(
+            "Resume: Found {}/{} complete pieces.",
+            self.downloaded_pieces,
+            self.piece_status.len()
+        );
+    }
+
+    // Helper to read a full piece from the multi-file structure
+    fn read_piece_from_disk(
+        &self,
+        index: usize,
+        piece_size: u64,
+        output_dir: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; piece_size as usize]; // Buffer is exact size requested
+        let standard_len = self.torrent.info.piece_length as u64; // Standard size for offsets
+
+        // GLOBAL OFFSET is always based on STANDARD length
+        let piece_global_start = (index as u64) * standard_len;
+        let piece_global_end = piece_global_start + piece_size;
+
+        // Prepare file list (Same logic as writer)
+        let files_list = if let Some(files) = &self.torrent.info.files {
+            files
+                .iter()
+                .map(|f| {
+                    let mut path = std::path::PathBuf::from(output_dir);
+                    path.push(&self.torrent.info.name);
+                    for part in &f.path {
+                        path.push(part);
+                    }
+                    (path, f.length)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut path = std::path::PathBuf::from(output_dir);
+            path.push(&self.torrent.info.name);
+            vec![(path, self.torrent.total_length())]
+        };
+
+        let mut file_global_start = 0u64;
+        let mut bytes_read = 0;
+
+        for (path, file_len) in files_list {
+            let file_global_end = file_global_start + (file_len as u64);
+
+            if file_global_end > piece_global_start && file_global_start < piece_global_end {
+                // Calc offsets
+                let read_start_in_piece = if file_global_start > piece_global_start {
+                    file_global_start - piece_global_start
+                } else {
+                    0
+                };
+
+                let read_end_in_piece = if file_global_end < piece_global_end {
+                    file_global_end - piece_global_start
+                } else {
+                    piece_size
+                };
+
+                let seek_pos_in_file = if piece_global_start > file_global_start {
+                    piece_global_start - file_global_start
+                } else {
+                    0
+                };
+
+                // Open file
+                if path.exists() {
+                    let mut file = std::fs::File::open(&path)?;
+                    file.seek(SeekFrom::Start(seek_pos_in_file))?;
+
+                    let slice_len = (read_end_in_piece - read_start_in_piece) as usize;
+                    let mut chunk_buf = vec![0u8; slice_len];
+                    file.read_exact(&mut chunk_buf)?;
+
+                    // Copy into main buffer
+                    let start = read_start_in_piece as usize;
+                    buffer[start..start + slice_len].copy_from_slice(&chunk_buf);
+                    bytes_read += slice_len;
+                } else {
+                    // Do not bail immediately, other files might exist.
+                    // But for strict checking, bail makes sense.
+                    anyhow::bail!("File missing");
+                }
+            }
+            file_global_start += file_len as u64;
+        }
+
+        if bytes_read == piece_size as usize {
+            Ok(buffer)
+        } else {
+            anyhow::bail!("Incomplete read")
+        }
     }
 }

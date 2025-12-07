@@ -8,6 +8,10 @@ use std::fs;
 pub struct Torrent {
     // The URL of the tracker that coordinates the swarm
     pub announce: String,
+
+    #[serde(rename = "announce-list")]
+    pub announce_list: Option<Vec<Vec<String>>>, // It's a list of lists of strings
+
     // The dictionary containing metadata about the file(s)
     pub info: Info,
 }
@@ -83,5 +87,43 @@ impl Torrent {
             return files.iter().map(|f| f.length).sum();
         }
         0
+    }
+
+    pub fn get_tracker_urls(&self) -> Vec<String> {
+        let mut trackers = Vec::new();
+
+        // 1. Always add the main announce URL first
+        trackers.push(self.announce.clone());
+
+        // 2. Add all backups from the announce-list
+        if let Some(tiers) = &self.announce_list {
+            for tier in tiers {
+                for url in tier {
+                    if !trackers.contains(url) {
+                        trackers.push(url.clone());
+                    }
+                }
+            }
+        }
+        trackers
+    }
+
+    pub fn calculate_piece_size(&self, piece_index: usize) -> u32 {
+        let piece_len = self.info.piece_length as u64;
+        let total_len = self.total_length();
+        let num_pieces = self.info.pieces.len() / 20;
+
+        // If it's the last piece, the size is the remainder
+        if piece_index == num_pieces - 1 {
+            let remainder = total_len % piece_len as i64;
+            if remainder == 0 {
+                piece_len as u32
+            } else {
+                remainder as u32
+            }
+        } else {
+            // Otherwise, it's the standard size
+            piece_len as u32
+        }
     }
 }
