@@ -4,44 +4,58 @@ use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use std::fs;
 
-#[derive(Debug,Serialize, Deserialize, Clone)]
+/// Represents the top-level dictionary of a Metainfo (.torrent) file.
+///
+/// This structure holds the necessary metadata to connect to trackers
+/// and validate the data content of the torrent.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Torrent {
-    // The URL of the tracker that coordinates the swarm
+    /// The URL of the primary tracker.
     pub announce: String,
 
+    /// Optional list of backup trackers (BEP 12 Multitracker Metadata Extension).
+    /// Structure: A list of tiers, where each tier is a list of tracker URLs.
     #[serde(rename = "announce-list")]
-    pub announce_list: Option<Vec<Vec<String>>>, // It's a list of lists of strings
+    pub announce_list: Option<Vec<Vec<String>>>,
 
-    // The dictionary containing metadata about the file(s)
+    /// The dictionary containing specific metadata about the file(s) and pieces.
     pub info: Info,
 }
 
+/// The 'info' dictionary containing file structure and integrity data.
+///
+/// The SHA-1 hash of the Bencoded form of this struct is the "Info Hash",
+/// which uniquely identifies the torrent in the global swarm.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Info {
+    /// Suggested name for the file (single-file) or root directory (multi-file).
     pub name: String,
 
-    // Map 'piece length' from Bencode (space) to 'piece_length' in Rust (snake_case)
+    /// Number of bytes in each piece (usually a power of 2, e.g., 256KB).
     #[serde(rename = "piece length")]
     pub piece_length: usize,
 
-    // The concatenated SHA-1 hashes of all pieces.
-    // Using ByteBuf forces Serde to treat this as a raw binary blob
-    // instead of a list of integers.
+    /// A concatenated string of 20-byte SHA-1 hashes, one per piece.
+    /// Using ByteBuf ensures Serde treats this as raw binary data rather than a generic array.
     pub pieces: ByteBuf,
 
-    // File size (Optional to support multi-file torrents structure in future)
+    /// Length of the file in bytes. Present only in single-file mode.
     pub length: Option<i64>,
 
+    /// List of files. Present only in multi-file mode.
     pub files: Option<Vec<FileNode>>,
 }
 
+/// Represents a single file within a multi-file torrent structure.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct FileNode {
     pub length: i64,
-    pub path: Vec<String>, // e.g., ["bin", "data.pak"]
+    /// The path components of the file (e.g., ["folder", "subfolder", "file.txt"]).
+    pub path: Vec<String>,
 }
 
 impl Torrent {
+    /// Reads and deserializes a .torrent file from the specified path.
     pub fn read(file_path: &str) -> anyhow::Result<Self> {
         let file_content = fs::read(file_path).context("Failed to read torrent file")?;
 
@@ -51,11 +65,11 @@ impl Torrent {
         Ok(torrent)
     }
 
-    // Calculates the SHA-1 hash of the 'info' dictionary.
-    // This hash uniquely identifies the torrent in the swarm.
+    /// Calculates the Info Hash (SHA-1) of the 'info' dictionary.
+    ///
+    /// This requires re-serializing the parsed `Info` struct back into Bencode
+    /// to ensure the hash matches the original file exactly.
     pub fn calculate_info_hash(&self) -> anyhow::Result<[u8; 20]> {
-        // We must re-serialize the parsed info struct back to Bencode bytes
-        // to calculate the hash correctly.
         let info_bytes = serde_bencode::to_bytes(&self.info)?;
 
         let mut hasher = Sha1::new();
@@ -65,6 +79,10 @@ impl Torrent {
         Ok(result.into())
     }
 
+    /// Extracts the expected SHA-1 hash for a specific piece index.
+    ///
+    /// The `pieces` field is a flat byte array where every 20 bytes corresponds
+    /// to one piece.
     pub fn get_piece_hash(&self, piece_index: usize) -> anyhow::Result<[u8; 20]> {
         const HASH_LEN: usize = 20;
         let start = piece_index * HASH_LEN;
@@ -79,6 +97,8 @@ impl Torrent {
         Ok(hash)
     }
 
+    /// Calculates the total size of the torrent in bytes.
+    /// Handles both single-file and multi-file structures.
     pub fn total_length(&self) -> i64 {
         if let Some(len) = self.info.length {
             return len;
@@ -89,13 +109,17 @@ impl Torrent {
         0
     }
 
+    /// Aggregates all tracker URLs into a single flat list.
+    ///
+    /// Combines the primary `announce` URL with the `announce-list` tiers,
+    /// ensuring no duplicates are returned.
     pub fn get_tracker_urls(&self) -> Vec<String> {
         let mut trackers = Vec::new();
 
-        // 1. Always add the main announce URL first
+        // 1. Add primary tracker
         trackers.push(self.announce.clone());
 
-        // 2. Add all backups from the announce-list
+        // 2. Add backup trackers
         if let Some(tiers) = &self.announce_list {
             for tier in tiers {
                 for url in tier {
@@ -108,12 +132,18 @@ impl Torrent {
         trackers
     }
 
+    /// Calculates the exact byte size of a specific piece.
+    ///
+    /// While most pieces are exactly `piece_length`, the final piece is usually smaller
+    /// (the remainder of the total size). Requesting the wrong size for the last piece
+    /// will cause peers to drop the connection.
     pub fn calculate_piece_size(&self, piece_index: usize) -> u32 {
         let piece_len = self.info.piece_length as u64;
         let total_len = self.total_length();
+        // Calculate total number of pieces (ceiling division)
         let num_pieces = self.info.pieces.len() / 20;
 
-        // If it's the last piece, the size is the remainder
+        // Check if this is the last piece
         if piece_index == num_pieces - 1 {
             let remainder = total_len % piece_len as i64;
             if remainder == 0 {
@@ -122,7 +152,7 @@ impl Torrent {
                 remainder as u32
             }
         } else {
-            // Otherwise, it's the standard size
+            // Standard piece
             piece_len as u32
         }
     }

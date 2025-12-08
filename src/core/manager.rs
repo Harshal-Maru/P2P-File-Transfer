@@ -9,6 +9,12 @@ pub enum PieceStatus {
     Complete,
 }
 
+/// Manages the state of the torrent download, including piece tracking,
+/// file I/O, and data verification.
+///
+/// This struct acts as the "Single Source of Truth" for the download progress.
+/// It coordinates multiple concurrent workers to ensure pieces are downloaded
+/// only once and written to the correct location on disk.
 pub struct TorrentManager {
     pub torrent: Torrent,
     pub piece_status: Vec<PieceStatus>,
@@ -17,6 +23,7 @@ pub struct TorrentManager {
 
 impl TorrentManager {
     pub fn new(torrent: Torrent) -> Self {
+        // Calculate total pieces based on the piece length (usually 20 bytes per hash)
         let piece_count = torrent.info.pieces.len() / 20;
         Self {
             torrent,
@@ -25,16 +32,16 @@ impl TorrentManager {
         }
     }
 
-    // We iterate through pieces. We pick one ONLY if:
-    // 1. It is Pending
-    // 2. The connected peer actually HAS it
+    /// Selects the next available piece to download based on the connected peer's availability.
+    ///
+    /// Implements a simple "Rarest First" or sequential strategy (currently sequential).
+    /// Returns `Some(index)` if a pending piece is found that the peer possesses.
     pub fn pick_next_piece(&mut self, peer_bitfield: &[bool]) -> Option<usize> {
         for (index, status) in self.piece_status.iter_mut().enumerate() {
             if *status == PieceStatus::Pending {
-                // Check if the peer has this piece
+                // Only assign if the peer actually has this piece
                 if index < peer_bitfield.len() && peer_bitfield[index] {
                     *status = PieceStatus::InProgress;
-                    println!("Manager: Assigned Piece {} to a worker", index);
                     return Some(index);
                 }
             }
@@ -42,12 +49,14 @@ impl TorrentManager {
         None
     }
 
+    /// Marks a piece as fully downloaded and verified.
+    /// Updates the global progress counter.
     pub fn mark_piece_complete(&mut self, index: usize) {
         if self.piece_status[index] != PieceStatus::Complete {
             self.piece_status[index] = PieceStatus::Complete;
             self.downloaded_pieces += 1;
             println!(
-                "Manager: Piece {} finished. Progress: {}/{}",
+                "Piece {} finished. Progress: {}/{}",
                 index,
                 self.downloaded_pieces,
                 self.piece_status.len()
@@ -55,9 +64,12 @@ impl TorrentManager {
         }
     }
 
+    /// Resets a piece status to Pending.
+    ///
+    /// This is typically called when a worker disconnects or when a downloaded piece
+    /// fails the SHA-1 hash verification.
     pub fn reset_piece(&mut self, index: usize) {
         if self.piece_status[index] != PieceStatus::Complete {
-            println!("Manager: Resetting Piece {} to Pending", index);
             self.piece_status[index] = PieceStatus::Pending;
         }
     }
@@ -66,6 +78,13 @@ impl TorrentManager {
         self.downloaded_pieces == self.piece_status.len()
     }
 
+    /// Scans the disk on startup to identify existing files and verify their integrity.
+    ///
+    /// This function performs two critical tasks:
+    /// 1. **Pre-allocation:** Creates empty files of the correct size to prevent
+    ///    sparse file read errors and reduce disk fragmentation.
+    /// 2. **Resume:** Reads existing data, hashes it, and updates the `piece_status`
+    ///    to skip re-downloading valid pieces.
     pub fn verify_existing_data(&mut self) {
         println!("Checking existing files for resume...");
         let output_dir = "downloads";
@@ -94,7 +113,6 @@ impl TorrentManager {
                 std::fs::create_dir_all(parent).ok();
             }
 
-            // Open for Read/Write/Create
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -104,12 +122,15 @@ impl TorrentManager {
                 Ok(file) => {
                     let current_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
+                    // If file is missing or truncated, extend it.
+                    // Important: We assume the OS fills the gap with zeros.
                     if current_len < *length as u64 {
                         println!("Pre-allocating file: {:?} ({} bytes)", path, length);
                         if let Err(e) = file.set_len(*length as u64) {
                             println!("Failed to pre-allocate file: {}", e);
                         }
-                        // FIX: Force OS to write the size change to disk IMMEDIATELY
+                        // CRITICAL: Force OS to flush metadata changes to disk immediately.
+                        // This prevents race conditions where the reader sees a 0-byte file.
                         let _ = file.sync_all();
                     }
                 }
@@ -128,6 +149,7 @@ impl TorrentManager {
 
             let expected_size = self.torrent.calculate_piece_size(piece_index) as u64;
 
+            // Reuse the robust read logic to check the disk
             match self.read_piece_from_disk(piece_index, expected_size, output_dir) {
                 Ok(buffer) => {
                     let mut hasher = Sha1::new();
@@ -140,7 +162,7 @@ impl TorrentManager {
                     }
                 }
                 Err(_) => {
-                    // Fail silently, Manager will mark as Pending
+                    // Fail silently; piece remains 'Pending' and will be downloaded.
                 }
             }
         }
@@ -152,21 +174,24 @@ impl TorrentManager {
         );
     }
 
-    // Helper to read a full piece from the multi-file structure
+    /// Reads a specific piece from the disk, handling logic for pieces that span
+    /// across multiple files.
+    ///
+    /// This function is public to support the seeding functionality (uploading to peers).
     pub fn read_piece_from_disk(
         &self,
         index: usize,
         piece_size: u64,
         output_dir: &str,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; piece_size as usize]; // Buffer is exact size requested
-        let standard_len = self.torrent.info.piece_length as u64; // Standard size for offsets
+        let mut buffer = vec![0u8; piece_size as usize];
+        let standard_len = self.torrent.info.piece_length as u64;
 
-        // GLOBAL OFFSET is always based on STANDARD length
+        // Calculate global byte offsets for this piece
         let piece_global_start = (index as u64) * standard_len;
         let piece_global_end = piece_global_start + piece_size;
 
-        // Prepare file list (Same logic as writer)
+        // Flatten the multi-file structure into a linear list of (Path, Length)
         let files_list = if let Some(files) = &self.torrent.info.files {
             files
                 .iter()
@@ -191,8 +216,9 @@ impl TorrentManager {
         for (path, file_len) in files_list {
             let file_global_end = file_global_start + (file_len as u64);
 
+            // Check if this file contains any part of the requested piece
             if file_global_end > piece_global_start && file_global_start < piece_global_end {
-                // Calc offsets
+                // Calculate the byte range relative to the PIECE
                 let read_start_in_piece = if file_global_start > piece_global_start {
                     file_global_start - piece_global_start
                 } else {
@@ -205,13 +231,13 @@ impl TorrentManager {
                     piece_size
                 };
 
+                // Calculate the byte offset relative to the FILE
                 let seek_pos_in_file = if piece_global_start > file_global_start {
                     piece_global_start - file_global_start
                 } else {
                     0
                 };
 
-                // Open file
                 if path.exists() {
                     let mut file = std::fs::File::open(&path)?;
                     file.seek(SeekFrom::Start(seek_pos_in_file))?;
@@ -220,14 +246,12 @@ impl TorrentManager {
                     let mut chunk_buf = vec![0u8; slice_len];
                     file.read_exact(&mut chunk_buf)?;
 
-                    // Copy into main buffer
+                    // Copy read data into the main buffer
                     let start = read_start_in_piece as usize;
                     buffer[start..start + slice_len].copy_from_slice(&chunk_buf);
                     bytes_read += slice_len;
                 } else {
-                    // Do not bail immediately, other files might exist.
-                    // But for strict checking, bail makes sense.
-                    anyhow::bail!("File missing");
+                    anyhow::bail!("File missing during read operation");
                 }
             }
             file_global_start += file_len as u64;
@@ -236,16 +260,24 @@ impl TorrentManager {
         if bytes_read == piece_size as usize {
             Ok(buffer)
         } else {
-            anyhow::bail!("Incomplete read")
+            anyhow::bail!(
+                "Incomplete read: expected {} bytes, got {}",
+                piece_size,
+                bytes_read
+            )
         }
     }
 
-
+    /// Writes a downloaded piece to disk.
+    ///
+    /// This mirrors `read_piece_from_disk` but performs writes. It ensures data is
+    /// correctly distributed across file boundaries if a piece spans multiple files.
+    /// Includes `sync_all()` calls to enforce data durability.
     pub fn write_piece_to_disk(&self, index: usize, data: &[u8]) -> anyhow::Result<()> {
         let output_dir = "downloads";
-        let piece_len = self.torrent.calculate_piece_size(index) as u64; // Uses the fix we made earlier
+        let piece_len = self.torrent.calculate_piece_size(index) as u64;
 
-        // Safety check
+        // Safety check to ensure network logic delivered the correct amount of data
         if data.len() as u64 != piece_len {
             anyhow::bail!(
                 "Data length mismatch. Expected {}, got {}",
@@ -257,7 +289,6 @@ impl TorrentManager {
         let piece_global_start = (index as u64) * (self.torrent.info.piece_length as u64);
         let piece_global_end = piece_global_start + piece_len;
 
-        // Prepare file list (Reusing the logic that we know works)
         let files_list = if let Some(files) = &self.torrent.info.files {
             files
                 .iter()
@@ -281,9 +312,8 @@ impl TorrentManager {
         for (path, file_len) in files_list {
             let file_global_end = file_global_start + (file_len as u64);
 
-            // Check for Overlap
+            // Check overlap
             if file_global_end > piece_global_start && file_global_start < piece_global_end {
-                // Calculate offsets
                 let write_start_in_piece = if file_global_start > piece_global_start {
                     file_global_start - piece_global_start
                 } else {
@@ -300,7 +330,6 @@ impl TorrentManager {
                     0
                 };
 
-                // Perform Write
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
@@ -313,10 +342,10 @@ impl TorrentManager {
 
                 let buffer_slice =
                     &data[write_start_in_piece as usize..write_end_in_piece as usize];
-                file.write_all(buffer_slice)?;
-                file.sync_all()?; // Force save to disk
 
-                println!("Wrote {} bytes to {:?}", buffer_slice.len(), path);
+                file.write_all(buffer_slice)?;
+                // Critical for data integrity on crash/restart
+                file.sync_all()?;
             }
             file_global_start += file_len as u64;
         }
