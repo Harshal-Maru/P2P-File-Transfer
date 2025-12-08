@@ -7,7 +7,7 @@ use handshake::Handshake;
 use message::Message;
 use sha1::{Digest, Sha1};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -159,7 +159,37 @@ pub async fn run_peer_session(
                     }
                 }
 
-                Message::Request { .. } => {}
+                
+                Message::Request { index, begin, length } => {
+                    // 1. Lock Manager to check status
+                    let m = manager.lock().await;
+                    
+                    // 2. Do we have this piece?
+                    if m.piece_status.get(index as usize) == Some(&crate::core::manager::PieceStatus::Complete) {
+                         // Yes! Calculate size and prepare to read
+                         let piece_len = m.torrent.calculate_piece_size(index as usize) as u64;
+                         
+                         // 3. Read from disk (using our new trusty method, but reading)
+
+                         if let Ok(buffer) = m.read_piece_from_disk(index as usize, piece_len, "downloads") {
+                             // 4. Send the slice
+                             let start = begin as usize;
+                             let end = start + length as usize;
+                             
+                             if end <= buffer.len() {
+                                 let block_data = buffer[start..end].to_vec();
+                                 let response = Message::Piece {
+                                     index,
+                                     begin,
+                                     block: block_data,
+                                 };
+                                 drop(m); // Unlock before sending
+                                 stream.write_all(&response.serialize()).await?;
+                                 println!("Uploaded {} bytes to {}", length, peer_addr);
+                             }
+                         }
+                    } 
+                },
                 Message::KeepAlive => {}
             }
 

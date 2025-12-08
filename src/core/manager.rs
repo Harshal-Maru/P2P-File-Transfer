@@ -153,7 +153,7 @@ impl TorrentManager {
     }
 
     // Helper to read a full piece from the multi-file structure
-    fn read_piece_from_disk(
+    pub fn read_piece_from_disk(
         &self,
         index: usize,
         piece_size: u64,

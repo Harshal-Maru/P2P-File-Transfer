@@ -11,90 +11,108 @@ use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Parse Arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: cargo run <torrent_file>");
+        eprintln!("Usage:");
+        eprintln!("  Create:   cargo run -- create <input_path> <output_torrent_path>");
+        eprintln!("  Download: cargo run -- download <file.torrent>");
+        eprintln!("  Seed:     cargo run -- seed <file.torrent>");
         process::exit(1);
     }
 
-    // 2. Load Torrent & Meta Info
-    println!("Loading torrent file: {}", args[1]);
-    let torrent = core::torrent_info::Torrent::read(&args[1])?;
-    let info_hash = torrent.calculate_info_hash()?;
-    let peer_id = utils::generate_peer_id();
+    let command = &args[1];
 
-    println!("---------------------------------");
-    println!("File:       {}", torrent.info.name);
-    println!("Info Hash:  {}", hex::encode(&info_hash));
-    println!("Peer ID:    {}", String::from_utf8_lossy(&peer_id));
-    println!("---------------------------------");
-
-    // 3. Init Manager
-    // Note: We need a temporary mutable manager to run verification BEFORE wrapping in Arc<Mutex>
-    let mut temp_manager = TorrentManager::new(torrent.clone());
-
-    // CHECK EXISTING FILES
-    temp_manager.verify_existing_data();
-
-    // Now wrap it
-    let manager = Arc::new(Mutex::new(temp_manager));
-
-    // 4. SUPERVISION LOOP
-    loop {
-        // A. Check if done
-        {
-            let m = manager.lock().await;
-            if m.is_complete() {
-                println!("DOWNLOAD COMPLETE!");
-
-                drop(m);
-                sleep(Duration::from_secs(2)).await;
-
-                println!("Exiting.");
-                break;
-            }
-            println!(
-                "Status: {}/{} pieces. Refreshing peers...",
-                m.downloaded_pieces,
-                m.piece_status.len()
-            );
+    // --- CREATE MODE ---
+    if command == "create" {
+        if args.len() < 4 {
+            eprintln!("Usage: cargo run -- create <input_path> <output_torrent_path>");
+            process::exit(1);
         }
+        let input_path = &args[2];
+        let output_path = &args[3];
+        // Use a generic public tracker that works well
+        let tracker = "udp://tracker.opentrackr.org:1337";
 
-        // B. Contact Tracker
-        println!("Contacting Tracker...");
-        // We catch errors here so the loop doesn't crash if the tracker is temporarily down
-        match core::tracker::Response::request_peers(&torrent, &peer_id).await {
-            Ok(peers) => {
-                println!("Found {} peers. Spawning workers...", peers.len());
+        core::creator::create_torrent_file(input_path, tracker, output_path)?;
+        return Ok(());
+    }
 
-                // C. Spawn Tasks
-                for peer in peers.into_iter().take(20) {
-                    // Limit to 20 concurrent connections
-                    let manager_clone = manager.clone();
-                    let peer_id_clone = peer_id;
-                    let info_hash_clone = info_hash;
+    // --- DOWNLOAD & SEED MODES ---
+    if command == "download" || command == "seed" {
+        if args.len() < 3 {
+            eprintln!("Usage: cargo run -- {} <file.torrent>", command);
+            process::exit(1);
+        }
+        let torrent_path = &args[2];
+        let is_seeding_mode = command == "seed";
 
-                    tokio::spawn(async move {
-                        // We run the session. If it fails or finishes, the task dies.
-                        // The main loop will respawn new ones later if needed.
-                        let _ = network::run_peer_session(
-                            peer,
-                            info_hash_clone,
-                            peer_id_clone,
-                            manager_clone,
-                        )
-                        .await;
-                    });
+        println!("Loading torrent file: {}", torrent_path);
+        let torrent = core::torrent_info::Torrent::read(torrent_path)?;
+        let info_hash = torrent.calculate_info_hash()?;
+        let peer_id = utils::generate_peer_id();
+
+        println!("---------------------------------");
+        println!("File:       {}", torrent.info.name);
+        println!("Info Hash:  {}", hex::encode(&info_hash));
+        if is_seeding_mode {
+            println!("Mode:       SEEDING (Upload Only)");
+        }
+        println!("---------------------------------");
+
+        let mut temp_manager = TorrentManager::new(torrent.clone());
+        temp_manager.verify_existing_data();
+        let manager = Arc::new(Mutex::new(temp_manager));
+
+        // SUPERVISION LOOP
+        loop {
+            // A. Check Status
+            {
+                let m = manager.lock().await;
+                if m.is_complete() {
+                    if !is_seeding_mode {
+                        println!("DOWNLOAD COMPLETE!");
+                        drop(m);
+                        sleep(Duration::from_secs(2)).await; // Wait for disk flush
+                        println!("Exiting.");
+                        break;
+                    } else {
+                        // In Seed mode, we just keep going even if complete
+                        println!("Seeding... (Status: 100% complete)");
+                    }
+                } else {
+                    println!(
+                        "Status: {}/{} pieces. Refreshing peers...",
+                        m.downloaded_pieces,
+                        m.piece_status.len()
+                    );
                 }
             }
-            Err(e) => {
-                println!("Tracker failed: {}. Retrying in 5s...", e);
-            }
-        }
 
-        // D. Wait before asking again (End Game Strategy)
-        sleep(Duration::from_secs(10)).await;
+            // B. Contact Tracker
+            // (In a real client, we would update the tracker with "left=0" if seeding)
+            println!("Contacting Tracker...");
+            match core::tracker::Response::request_peers(&torrent, &peer_id).await {
+                Ok(peers) => {
+                    println!("Found {} peers. Spawning workers...", peers.len());
+                    for peer in peers.into_iter().take(20) {
+                        let m_clone = manager.clone();
+                        let p_clone = peer_id;
+                        let h_clone = info_hash;
+                        tokio::spawn(async move {
+                            // Run session (Download & Upload)
+                            let _ =
+                                network::run_peer_session(peer, h_clone, p_clone, m_clone).await;
+                        });
+                    }
+                }
+                Err(e) => println!("Tracker failed: {}. Retrying in 5s...", e),
+            }
+
+            // Wait interval
+            sleep(Duration::from_secs(10)).await;
+        }
+    } else {
+        eprintln!("Unknown command: {}", command);
     }
 
     Ok(())
