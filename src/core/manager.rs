@@ -1,6 +1,6 @@
 use crate::core::torrent_info::Torrent;
 use sha1::{Digest, Sha1};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PieceStatus {
@@ -66,22 +66,23 @@ impl TorrentManager {
         self.downloaded_pieces == self.piece_status.len()
     }
 
-// ... inside impl TorrentManager ...
-
     pub fn verify_existing_data(&mut self) {
         println!("Checking existing files for resume...");
         let output_dir = "downloads";
-        
+
         // --- PHASE 0: PRE-ALLOCATE FILES ---
-        // This ensures files exist and are the correct size, preventing "Read Errors" on the last piece
-        // and fixing sparse file issues.
         let files_list = if let Some(files) = &self.torrent.info.files {
-            files.iter().map(|f| {
-                let mut path = std::path::PathBuf::from(output_dir);
-                path.push(&self.torrent.info.name);
-                for part in &f.path { path.push(part); }
-                (path, f.length)
-            }).collect::<Vec<_>>()
+            files
+                .iter()
+                .map(|f| {
+                    let mut path = std::path::PathBuf::from(output_dir);
+                    path.push(&self.torrent.info.name);
+                    for part in &f.path {
+                        path.push(part);
+                    }
+                    (path, f.length)
+                })
+                .collect::<Vec<_>>()
         } else {
             let mut path = std::path::PathBuf::from(output_dir);
             path.push(&self.torrent.info.name);
@@ -92,21 +93,26 @@ impl TorrentManager {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            
+
             // Open for Read/Write/Create
-            match std::fs::OpenOptions::new().write(true).create(true).read(true).open(path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .read(true)
+                .open(path)
+            {
                 Ok(file) => {
-                    // Get current size
                     let current_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    
-                    // If file is too small, extend it to the correct size
+
                     if current_len < *length as u64 {
                         println!("Pre-allocating file: {:?} ({} bytes)", path, length);
                         if let Err(e) = file.set_len(*length as u64) {
                             println!("Failed to pre-allocate file: {}", e);
                         }
+                        // FIX: Force OS to write the size change to disk IMMEDIATELY
+                        let _ = file.sync_all();
                     }
-                },
+                }
                 Err(e) => println!("Failed to open file for pre-allocation: {}", e),
             }
         }
@@ -131,11 +137,10 @@ impl TorrentManager {
                     if actual_hash == expected_hash {
                         self.piece_status[piece_index] = PieceStatus::Complete;
                         self.downloaded_pieces += 1;
-                    } 
-                    // No need to print mismatch errors, we assume Pending if mismatch
-                },
+                    }
+                }
                 Err(_) => {
-                    // Ignore read errors (just means piece is missing)
+                    // Fail silently, Manager will mark as Pending
                 }
             }
         }
@@ -146,6 +151,7 @@ impl TorrentManager {
             self.piece_status.len()
         );
     }
+
     // Helper to read a full piece from the multi-file structure
     fn read_piece_from_disk(
         &self,
@@ -232,5 +238,88 @@ impl TorrentManager {
         } else {
             anyhow::bail!("Incomplete read")
         }
+    }
+
+
+    pub fn write_piece_to_disk(&self, index: usize, data: &[u8]) -> anyhow::Result<()> {
+        let output_dir = "downloads";
+        let piece_len = self.torrent.calculate_piece_size(index) as u64; // Uses the fix we made earlier
+
+        // Safety check
+        if data.len() as u64 != piece_len {
+            anyhow::bail!(
+                "Data length mismatch. Expected {}, got {}",
+                piece_len,
+                data.len()
+            );
+        }
+
+        let piece_global_start = (index as u64) * (self.torrent.info.piece_length as u64);
+        let piece_global_end = piece_global_start + piece_len;
+
+        // Prepare file list (Reusing the logic that we know works)
+        let files_list = if let Some(files) = &self.torrent.info.files {
+            files
+                .iter()
+                .map(|f| {
+                    let mut path = std::path::PathBuf::from(output_dir);
+                    path.push(&self.torrent.info.name);
+                    for part in &f.path {
+                        path.push(part);
+                    }
+                    (path, f.length)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut path = std::path::PathBuf::from(output_dir);
+            path.push(&self.torrent.info.name);
+            vec![(path, self.torrent.total_length())]
+        };
+
+        let mut file_global_start = 0u64;
+
+        for (path, file_len) in files_list {
+            let file_global_end = file_global_start + (file_len as u64);
+
+            // Check for Overlap
+            if file_global_end > piece_global_start && file_global_start < piece_global_end {
+                // Calculate offsets
+                let write_start_in_piece = if file_global_start > piece_global_start {
+                    file_global_start - piece_global_start
+                } else {
+                    0
+                };
+                let write_end_in_piece = if file_global_end < piece_global_end {
+                    file_global_end - piece_global_start
+                } else {
+                    piece_len
+                };
+                let seek_pos_in_file = if piece_global_start > file_global_start {
+                    piece_global_start - file_global_start
+                } else {
+                    0
+                };
+
+                // Perform Write
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(&path)?;
+                file.seek(std::io::SeekFrom::Start(seek_pos_in_file))?;
+
+                let buffer_slice =
+                    &data[write_start_in_piece as usize..write_end_in_piece as usize];
+                file.write_all(buffer_slice)?;
+                file.sync_all()?; // Force save to disk
+
+                println!("Wrote {} bytes to {:?}", buffer_slice.len(), path);
+            }
+            file_global_start += file_len as u64;
+        }
+        Ok(())
     }
 }

@@ -81,7 +81,7 @@ impl Response {
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Silently fail or print minimal error to keep logs clean
                         println!(" {} failed: {}", url, e);
                     }

@@ -106,12 +106,10 @@ pub async fn run_peer_session(
                     begin,
                     block,
                 } => {
-                    // Handle incoming data
                     if let Some(state) = &mut current_work {
                         if state.piece_index == index as usize {
+                            // ... (Copy to buffer logic stays the same) ...
                             let begin_usize = begin as usize;
-
-                            // Safety check
                             if begin_usize + block.len() <= state.piece_buffer.len() {
                                 state.piece_buffer[begin_usize..begin_usize + block.len()]
                                     .copy_from_slice(&block);
@@ -135,101 +133,17 @@ pub async fn run_peer_session(
                                         );
                                         m.mark_piece_complete(state.piece_index);
 
-                                        // --- MULTI-FILE WRITE LOGIC ---
-                                        let output_dir = "downloads";
-                                        let piece_len = state.piece_length as u64;
-                                        let piece_global_start =
-                                            (state.piece_index as u64) * piece_len;
-                                        let piece_global_end = piece_global_start + piece_len;
-
-                                        // 1. Get the list of files (handle single vs multi file torrents uniformly)
-                                        let files_list = if let Some(files) = &m.torrent.info.files
-                                        {
-                                            // Multi-file
-                                            files
-                                                .iter()
-                                                .map(|f| {
-                                                    let mut path =
-                                                        std::path::PathBuf::from(output_dir);
-                                                    path.push(&m.torrent.info.name);
-                                                    for part in &f.path {
-                                                        path.push(part);
-                                                    }
-                                                    (path, f.length)
-                                                })
-                                                .collect::<Vec<_>>()
-                                        } else {
-                                            // Single-file
-                                            let mut path = std::path::PathBuf::from(output_dir);
-                                            path.push(&m.torrent.info.name);
-                                            vec![(path, m.torrent.total_length())]
-                                        };
-
-                                        // 2. Iterate through files and write overlapping chunks
-                                        let mut file_global_start = 0u64;
-                                        for (path, file_len) in files_list {
-                                            let file_global_end =
-                                                file_global_start + (file_len as u64);
-
-                                            // Check overlap
-                                            if file_global_end > piece_global_start
-                                                && file_global_start < piece_global_end
-                                            {
-                                                // Calculate slice inside the piece buffer
-                                                let write_start_in_piece =
-                                                    if file_global_start > piece_global_start {
-                                                        file_global_start - piece_global_start
-                                                    } else {
-                                                        0
-                                                    };
-                                                let write_end_in_piece =
-                                                    if file_global_end < piece_global_end {
-                                                        file_global_end - piece_global_start
-                                                    } else {
-                                                        piece_len
-                                                    };
-
-                                                // Calculate offset inside the target file
-                                                let seek_pos_in_file =
-                                                    if piece_global_start > file_global_start {
-                                                        piece_global_start - file_global_start
-                                                    } else {
-                                                        0
-                                                    };
-
-                                                // Ensure dirs exist
-                                                if let Some(parent) = path.parent() {
-                                                    tokio::fs::create_dir_all(parent).await.ok();
-                                                }
-
-                                                // Write
-                                                let mut file = tokio::fs::OpenOptions::new()
-                                                    .write(true)
-                                                    .create(true)
-                                                    .open(&path)
-                                                    .await?;
-                                                file.seek(std::io::SeekFrom::Start(
-                                                    seek_pos_in_file,
-                                                ))
-                                                .await?;
-
-                                                let buffer_slice = &state.piece_buffer
-                                                    [write_start_in_piece as usize
-                                                        ..write_end_in_piece as usize];
-                                                file.write_all(buffer_slice).await?;
-                                                file.sync_all().await?;
-
-                                                let slice_len =
-                                                    write_end_in_piece - write_start_in_piece;
-                                                println!(
-                                                    "Wrote {} bytes to {:?}",
-                                                    slice_len, path
-                                                );
-                                            }
-                                            file_global_start += file_len as u64;
+                                        // --- NEW: DELEGATE WRITING TO MANAGER ---
+                                        // We pass the data to the manager. It knows exactly where to put it.
+                                        if let Err(e) = m.write_piece_to_disk(
+                                            state.piece_index,
+                                            &state.piece_buffer,
+                                        ) {
+                                            println!("Disk Write Failed: {}", e);
+                                            // Optional: reset piece if write failed
                                         }
+                                        // ----------------------------------------
 
-                                        // Done with this piece
                                         current_work = None;
                                     } else {
                                         println!(
